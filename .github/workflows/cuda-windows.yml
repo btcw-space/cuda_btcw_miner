@@ -1,0 +1,38 @@
+# Drop this file into cuda_btcw_miner/.github/workflows/cuda-windows.yml
+# Compiles the Windows miner on GitHub-hosted runners (no GPU execute).
+name: CUDA Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-nvcc:
+    name: nvcc Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.25
+        with:
+          cuda: "12.6.0"
+          method: network
+          sub-packages: '["nvcc","cudart"]'
+
+      - name: Build miner
+        shell: cmd
+        env:
+          CUDA_ARCH: sm_75
+          CUDA_SIGN_BATCH: "128"
+        run: build_cuda.bat
+
+      - name: Upload miner binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: btcw-cuda-miner-windows-x64
+          path: release/btcw_cuda_miner.exe
