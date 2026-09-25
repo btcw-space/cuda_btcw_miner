@@ -22,8 +22,8 @@ The GPU searches a 32-bit `test_case`. Each candidate is evaluated as follows:
 7. Compute `SHA256(SHA256(DER_signature))`.
 8. Compare the result with the fixed Stage-2 target `2^228 - 1`, equivalent
    to 28 leading zero bits in displayed hash order.
-9. Return a successful `test_case` through the existing 64-bit POSIX shared
-   memory nonce mailbox.
+9. Return a successful 32-bit `test_case` through the original 64-bit
+   shared-memory nonce mailbox (`0x0707070707070707` idle sentinel).
 
 The BTCW node remains the final authority. It regenerates the signature using
 `CKey::Sign(hash_no_sig, ..., false, test_case)` and validates it before block

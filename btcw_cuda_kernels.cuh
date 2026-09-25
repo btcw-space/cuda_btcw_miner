@@ -1800,13 +1800,11 @@ extern "C" __global__ void scalar_mul_generator(
 // =============================================================================
 // Copyright (c) 2026 btcw.space <btcw.space@proton.me>
 //
-// Implements the Bitcoin-PoW Stage 2 mining algorithm:
-//   1. Pick nonce from upper 64-bit space (GPU partitioned)
-//   2. mud = hash_no_sig + nonce  (uint256 LE addition)
-//   3. ECDSA sign(seckey, mud_LE_bytes): RFC 6979 nonce k, R = k*G, DER encode
-//   4. preimage = nonce(8 LE) || CompactSize(sig_len)(1) || DER_sig(N)
-//   5. hashPoW = double-SHA256(preimage)
-//   6. Check trailing bytes [28-31] for difficulty (reversed byte order)
+// Implements the Bitcoin-PoW NEWFORK signing-work algorithm:
+//   1. Pick a 32-bit test_case (GPU partitioned, wraps at 2^32)
+//   2. RFC6979 extra entropy = LE32(test_case) || 28 zero bytes
+//   3. ECDSA sign(seckey, hash_no_sig) with that extra entropy
+//   4. Accept only 70/71-byte DER, then Hash(DER) vs the fixed Stage-2 target
 //
 // Copyright (c) 2026 btcw.space. All rights reserved.
 // =============================================================================
@@ -2904,12 +2902,12 @@ FORCE_INLINE void rfc6979_step_d_words(const RFC6979_SECKEY_PRECOMP* pc,
 // Only the reduced message and LE32(test_case) vary between candidates.
 FORCE_INLINE void rfc6979_step_d_extra_words(
     const RFC6979_SECKEY_PRECOMP* pc, const uchar msg32[32],
-    ulong extra64, uint outw[8]) {
+    uint extra32, uint outw[8]) {
     uint si[8], so[8], w[16];
 #pragma unroll
     for (int i=0;i<8;i++) { si[i]=pc->step_d_inner[i]; so[i]=pc->step_d_outer[i]; }
 
-    // seckey[31] || msg32 || extra[0..30], extra = LE64(nonce) || zeros
+    // seckey[31] || msg32 || extra[0..30], extra = LE32(test_case) || zeros
     w[0] = pack_be4(pc->seckey31,msg32[0],msg32[1],msg32[2]);
     w[1] = pack_be4(msg32[3],msg32[4],msg32[5],msg32[6]);
     w[2] = pack_be4(msg32[7],msg32[8],msg32[9],msg32[10]);
@@ -2919,14 +2917,11 @@ FORCE_INLINE void rfc6979_step_d_extra_words(
     w[6] = pack_be4(msg32[23],msg32[24],msg32[25],msg32[26]);
     w[7] = pack_be4(msg32[27],msg32[28],msg32[29],msg32[30]);
     w[8] = ((uint)msg32[31] << 24) |
-           ((uint)(extra64 & 0xffUL) << 16) |
-           ((uint)((extra64 >> 8) & 0xffUL) << 8) |
-           ((uint)((extra64 >> 16) & 0xffUL));
-    w[9] = ((uint)((extra64 >> 24) & 0xffUL) << 24) |
-           ((uint)((extra64 >> 32) & 0xffUL) << 16) |
-           ((uint)((extra64 >> 40) & 0xffUL) << 8) |
-           ((uint)((extra64 >> 48) & 0xffUL));
-    w[10] = ((uint)((extra64 >> 56) & 0xffUL) << 24);
+           ((uint)(extra32 & 0xffU) << 16) |
+           ((uint)((extra32 >> 8) & 0xffU) << 8) |
+           ((uint)((extra32 >> 16) & 0xffU));
+    w[9] = ((uint)((extra32 >> 24) & 0xffU) << 24);
+    w[10] = 0U;
 #pragma unroll
     for (int i=11;i<16;i++) w[i]=0U;
     sha256_transform_words_rfc_unrolled(si,w);
@@ -2955,7 +2950,7 @@ FORCE_INLINE void rfc6979_step_d_extra_words(
 // fixed three-block shape after the HMAC key block.
 FORCE_INLINE void hmac_states_msg129_extra_vwords_rfc(
     const uint inner0[8], const uint outer0[8], const uint vw[8], uchar tag,
-    const uchar seckey32[32], const uchar msg32[32], ulong extra64,
+    const uchar seckey32[32], const uchar msg32[32], uint extra32,
     uint outw[8]) {
     uint si[8], so[8], w[16];
 #pragma unroll
@@ -2980,14 +2975,11 @@ FORCE_INLINE void hmac_states_msg129_extra_vwords_rfc(
     w[6] = pack_be4(msg32[23],msg32[24],msg32[25],msg32[26]);
     w[7] = pack_be4(msg32[27],msg32[28],msg32[29],msg32[30]);
     w[8] = ((uint)msg32[31] << 24) |
-           ((uint)(extra64 & 0xffUL) << 16) |
-           ((uint)((extra64 >> 8) & 0xffUL) << 8) |
-           ((uint)((extra64 >> 16) & 0xffUL));
-    w[9] = ((uint)((extra64 >> 24) & 0xffUL) << 24) |
-           ((uint)((extra64 >> 32) & 0xffUL) << 16) |
-           ((uint)((extra64 >> 40) & 0xffUL) << 8) |
-           ((uint)((extra64 >> 48) & 0xffUL));
-    w[10] = ((uint)((extra64 >> 56) & 0xffUL) << 24);
+           ((uint)(extra32 & 0xffU) << 16) |
+           ((uint)((extra32 >> 8) & 0xffU) << 8) |
+           ((uint)((extra32 >> 16) & 0xffU));
+    w[9] = ((uint)((extra32 >> 24) & 0xffU) << 24);
+    w[10] = 0U;
 #pragma unroll
     for (int i=11;i<16;i++) w[i]=0U;
     sha256_transform_words_rfc_unrolled(si,w);
@@ -3011,15 +3003,15 @@ FORCE_INLINE void hmac_states_msg129_extra_vwords_rfc(
 
 FORCE_INLINE void rfc6979_generate_k_testcase_words(
     const RFC6979_SECKEY_PRECOMP* pc, const uchar seckey32[32],
-    const uchar msgmod32[32], ulong extra64, uint nonce_words[8]) {
+    const uchar msgmod32[32], uint extra32, uint nonce_words[8]) {
     uint k[8], v[8], is[8], os[8];
-    rfc6979_step_d_extra_words(pc,msgmod32,extra64,k);
+    rfc6979_step_d_extra_words(pc,msgmod32,extra32,k);
 #pragma unroll
     for (int i=0;i<8;i++) v[i]=0x01010101U;
     hmac_key_states32_words_rfc(k,is,os);
     hmac_states_msg32_u32_rfc(is,os,v,v);
     hmac_states_msg129_extra_vwords_rfc(
-        is,os,v,(uchar)0x01,seckey32,msgmod32,extra64,k);
+        is,os,v,(uchar)0x01,seckey32,msgmod32,extra32,k);
     hmac_key_states32_words_rfc(k,is,os);
     hmac_states_msg32_u32_rfc(is,os,v,v);
     hmac_states_msg32_u32_rfc(is,os,v,v);
@@ -3097,7 +3089,7 @@ FORCE_INLINE void rfc6979_generate_k_precomp_words(
 // buffer containing LE32(test_case) followed by 28 zero bytes.
 FORCE_INLINE void rfc6979_generate_k_testcase(const uchar* seckey32,
                                                const uchar* msg32,
-                                               ulong extra64,
+                                               uint extra32,
                                                uint nonce_words[8]) {
     uchar v[32], k[32], keydata[96], extra[32];
     HMAC_SHA256_CTX hmac;
@@ -3107,12 +3099,11 @@ FORCE_INLINE void rfc6979_generate_k_testcase(const uchar* seckey32,
     uchar msgmod32[32];
     scalar_get_b32(msgmod32, &msg_tmp);
     for (int i=0;i<32;i++) { keydata[i]=seckey32[i]; keydata[32+i]=msgmod32[i]; extra[i]=0; }
-    extra[0]=(uchar)extra64; extra[1]=(uchar)(extra64>>8); extra[2]=(uchar)(extra64>>16); extra[3]=(uchar)(extra64>>24);
-    extra[4]=(uchar)(extra64>>32); extra[5]=(uchar)(extra64>>40); extra[6]=(uchar)(extra64>>48); extra[7]=(uchar)(extra64>>56);
+    extra[0]=(uchar)extra32; extra[1]=(uchar)(extra32>>8); extra[2]=(uchar)(extra32>>16); extra[3]=(uchar)(extra32>>24);
     for (int i=0;i<32;i++) keydata[64+i]=extra[i];
     for (int i=0;i<32;i++) { v[i]=1; k[i]=0; }
     uchar zero=0, one=1;
-    const uint kdlen = extra64 ? 96u : 64u;
+    const uint kdlen = extra32 ? 96u : 64u;
     hmac_sha256_init(&hmac,k,32); hmac_sha256_update(&hmac,v,32); hmac_sha256_update(&hmac,&zero,1); hmac_sha256_update(&hmac,keydata,kdlen); hmac_sha256_final(&hmac,k);
     hmac_sha256_init(&hmac,k,32); hmac_sha256_update(&hmac,v,32); hmac_sha256_final(&hmac,v);
     hmac_sha256_init(&hmac,k,32); hmac_sha256_update(&hmac,v,32); hmac_sha256_update(&hmac,&one,1); hmac_sha256_update(&hmac,keydata,kdlen); hmac_sha256_final(&hmac,k);
@@ -4582,7 +4573,7 @@ FORCE_INLINE void btcw_double_sha256_preimage_2block(const uchar* preimage,
 // exactly two blocks in the first SHA-256 and one block in the second SHA-256.
 // Keeping this fixed-shape path out of SHA256_CTX removes the byte-at-a-time
 // update/final machinery from the per-candidate hot loop.
-FORCE_INLINE uint btcw_der_meets_fixed_target(const uchar* der, uint len, const uchar* target32) {
+FORCE_INLINE uint btcw_der_meets_fixed_target(const uchar* der, uint len) {
     uint s[8];
     s[0]=0x6a09e667U; s[1]=0xbb67ae85U; s[2]=0x3c6ef372U; s[3]=0xa54ff53aU;
     s[4]=0x510e527fU; s[5]=0x9b05688cU; s[6]=0x1f83d9abU; s[7]=0x5be0cd19U;
@@ -4622,10 +4613,11 @@ FORCE_INLINE uint btcw_der_meets_fixed_target(const uchar* der, uint len, const 
     w[15] = 256U;
     sha256_transform_words(d, w);
 
-    uchar out32[32];
-#pragma unroll
-    for (int i=0;i<8;++i) write_be32(out32 + 4*i, d[i]);
-    return hash_meets_target_le(out32, target32);
+    // The installed target is LE 2^228-1: bytes 31..29 must be zero and
+    // byte 28 must be <= 0x0f.  SHA state d[7] represents bytes 28..31 in
+    // big-endian order.  Return the predicate directly so the compiler can
+    // discard digest serialization and the eight-byte comparison loop.
+    return ((d[7] & 0x00ffffffU) == 0U) && ((d[7] >> 24) <= 0x0fU);
 }
 
 FORCE_INLINE void btcw_hash_signature_direct(ulong nonce,
@@ -4716,8 +4708,6 @@ extern "C" __global__ void btcw_mine(
     const uchar* hash_no_sig,
     volatile ulong* result_nonce,
     volatile uint* result_found,
-    volatile uint* result_der_len,
-    volatile uchar* result_der,
     volatile uint* hashrate_ctr,
     const ulong nonce_base,
     const uint gpu_num,
@@ -4759,9 +4749,10 @@ extern "C" __global__ void btcw_mine(
             for(int j=0;j<FIELD_INV_SUBBATCH;j++){
             const int b=ec_base+j;
             ulong idx64=nonce_base+(ulong)gid*NONCES_PER_THREAD+(ulong)(base_iter+b);
-            if(idx64==0UL) idx64=1UL;
+            uint test_case=(uint)idx64;
+            if(test_case==0u) test_case=1u; // mailbox reserves zero; skip case 0
             uint nw[8]; Scalar ktmp;
-            rfc6979_generate_k_testcase_words(&rfc_pc,seckey,msgmod32,idx64,nw);
+            rfc6979_generate_k_testcase_words(&rfc_pc,seckey,msgmod32,test_case,nw);
             scalar_set_sha256_words(&ktmp,nw); scalar_reduce(&ktmp);
             if(scalar_is_zero(&ktmp)){batch_ok=0;continue;}
             scalar_mul_generator_precomp_xyzz(&rxj_batch[j],&z_batch[j],&ktmp,
@@ -4778,11 +4769,12 @@ extern "C" __global__ void btcw_mine(
             }
         }
         if(!batch_ok) continue;
+        scalar_batch_inverse_global(k_scratch,(ulong)get_global_size(0),(ulong)gid);
 
         #pragma unroll
         for(int b=0;b<SIGN_BATCH;b++){
-            ulong extra64=nonce_base+(ulong)gid*NONCES_PER_THREAD+(ulong)(base_iter+b);
-            if(extra64==0UL) extra64=1UL;
+            uint test_case=(uint)(nonce_base+(ulong)gid*NONCES_PER_THREAD+(ulong)(base_iter+b));
+            if(test_case==0u) test_case=1u;
             Scalar kinv=k_scratch[(ulong)b*(ulong)get_global_size(0)+(ulong)gid];
             FieldElement rx=rx_scratch[(ulong)b*(ulong)get_global_size(0)+(ulong)gid];
             Scalar r,sig_s;
@@ -4791,12 +4783,8 @@ extern "C" __global__ void btcw_mine(
             scalar_get_b32(rb,&r); scalar_get_b32(sb,&sig_s);
             int len=der_encode_signature(der,rb,sb);
             if(len!=70 && len!=71) continue;
-            if(btcw_der_meets_fixed_target(der,(uint)len,target32)){
-                if(atomicCAS((uint*)result_found,0u,1u)==0u){
-                    *result_nonce=extra64;
-                    *result_der_len=(uint)len;
-                    for(int i=0;i<len && i<72;i++) result_der[i]=der[i];
-                }
+            if(btcw_der_meets_fixed_target(der,(uint)len)){
+                if(atomicCAS((uint*)result_found,0u,1u)==0u) *result_nonce=(ulong)test_case;
             }
         }
     }
@@ -4807,9 +4795,9 @@ extern "C" __global__ void btcw_mine(
 #pragma unroll
         for(int b=0;b<SIGN_BATCH;b++){
             ulong idx64=nonce_base+(ulong)gid*NONCES_PER_THREAD+(ulong)(base_iter+b);
-            if(idx64==0UL) idx64=1UL;
+            uint test_case=(uint)idx64; if(test_case==0u)test_case=1u;
             uint nw[8]; Scalar ktmp;
-            rfc6979_generate_k_testcase_words(&rfc_pc,seckey,msgmod32,idx64,nw);
+            rfc6979_generate_k_testcase_words(&rfc_pc,seckey,msgmod32,test_case,nw);
             scalar_set_sha256_words(&ktmp,nw); scalar_reduce(&ktmp);
             if(scalar_is_zero(&ktmp)){batch_ok=0;continue;}
             scalar_mul_generator_precomp_xyzz(&rxj_batch[b],&z_batch[b],&ktmp,
@@ -4821,20 +4809,15 @@ extern "C" __global__ void btcw_mine(
         field_batch_inverse64x2_inplace(z_batch);
 #pragma unroll
         for(int b=0;b<SIGN_BATCH;b++){FieldElement x;field_mul_impl(&x,&rxj_batch[b],&z_batch[b]);rxj_batch[b]=x;}
+        scalar_batch_inverse_global(k_scratch,(ulong)get_global_size(0),(ulong)gid);
 #pragma unroll
         for(int b=0;b<SIGN_BATCH;b++){
-            ulong extra64=nonce_base+(ulong)gid*NONCES_PER_THREAD+(ulong)(base_iter+b); if(extra64==0UL)extra64=1UL;
+            uint test_case=(uint)(nonce_base+(ulong)gid*NONCES_PER_THREAD+(ulong)(base_iter+b)); if(test_case==0u)test_case=1u;
             Scalar kinv=k_scratch[(ulong)b*(ulong)get_global_size(0)+(ulong)gid],r,sig_s;
             if(!ecdsa_finish_batch32_scalars(&sec,&msg_scalar,&kinv,&rxj_batch[b],&r,&sig_s))continue;
             uchar rb[32],sb[32],der[73]; scalar_get_b32(rb,&r);scalar_get_b32(sb,&sig_s);
             int len=der_encode_signature(der,rb,sb); if(len!=70&&len!=71)continue;
-            if(btcw_der_meets_fixed_target(der,(uint)len,target32)){
-                if(atomicCAS((uint*)result_found,0u,1u)==0u){
-                    *result_nonce=extra64;
-                    *result_der_len=(uint)len;
-                    for(int i=0;i<len && i<72;i++) result_der[i]=der[i];
-                }
-            }
+            if(btcw_der_meets_fixed_target(der,(uint)len))if(atomicCAS((uint*)result_found,0u,1u)==0u)*result_nonce=(ulong)test_case;
         }
     }
 #endif

@@ -44,13 +44,7 @@ static const int CTX_SIZE_BYTES=8*20, KEY_SIZE_BYTES=32, HASH_NO_SIG_SIZE_BYTES=
 // Keep the original node IPC contract unchanged: key[32] + ctx[160] + hash_no_sig[32].
 static const int TOTAL_BYTES_SEND=CTX_SIZE_BYTES+KEY_SIZE_BYTES+HASH_NO_SIG_SIZE_BYTES;
 static const uint64_t SENTINEL_NONCE=0x0707070707070707ULL;
-struct SharedData {
-  volatile uint64_t nonce;
-  volatile uint32_t der_len;
-  volatile uint8_t der[72];
-  volatile uint8_t data[TOTAL_BYTES_SEND];
-  volatile uint8_t target[32];
-};
+struct SharedData { volatile uint64_t nonce; volatile uint8_t data[TOTAL_BYTES_SEND]; };
 
 int main(int argc,char** argv){
  signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
@@ -106,8 +100,8 @@ int main(int argc,char** argv){
  for(int i=0;i<6;i++){ size_t bytes=EN[i]*8ULL*sizeof(ulong); CUDA_CHECK(cudaMalloc((void**)&dtab[i],bytes)); uint entries=(uint)EN[i]; int t=256; size_t b=(EN[i]+t-1)/t; printf("  group %d/6: %u entries (%zu MiB)\n",i+1,entries,bytes/(1024*1024)); precompute_ecmult_gen_table<<<(unsigned)b,t>>>(dtab[i],(uint)i,entries); CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize()); }
  print_timestamp(); printf("Ecmult table ready (GLV W24/W9, 6 groups, ~2560 MiB).\n");
 
- uchar *dkey=nullptr,*dhash=nullptr,*dtarget=nullptr,*dder=nullptr; ulong* dnonce=nullptr; uint *dfound=nullptr,*dctr=nullptr,*dderlen=nullptr;
- CUDA_CHECK(cudaMalloc((void**)&dkey,32)); CUDA_CHECK(cudaMalloc((void**)&dhash,32)); CUDA_CHECK(cudaMalloc((void**)&dtarget,32)); CUDA_CHECK(cudaMalloc((void**)&dnonce,sizeof(ulong))); CUDA_CHECK(cudaMalloc((void**)&dfound,sizeof(uint))); CUDA_CHECK(cudaMalloc((void**)&dctr,sizeof(uint))); CUDA_CHECK(cudaMalloc((void**)&dderlen,sizeof(uint))); CUDA_CHECK(cudaMalloc((void**)&dder,72));
+ uchar *dkey=nullptr,*dhash=nullptr,*dtarget=nullptr; ulong* dnonce=nullptr; uint *dfound=nullptr,*dctr=nullptr;
+ CUDA_CHECK(cudaMalloc((void**)&dkey,32)); CUDA_CHECK(cudaMalloc((void**)&dhash,32)); CUDA_CHECK(cudaMalloc((void**)&dtarget,32)); CUDA_CHECK(cudaMalloc((void**)&dnonce,sizeof(ulong))); CUDA_CHECK(cudaMalloc((void**)&dfound,sizeof(uint))); CUDA_CHECK(cudaMalloc((void**)&dctr,sizeof(uint)));
 
 #ifdef _WIN32
  HANDLE mapping=CreateFileMappingA(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,(DWORD)sizeof(SharedData),SHM_NAME);
@@ -125,38 +119,34 @@ int main(int argc,char** argv){
  print_timestamp(); printf("Work size: %zu%s\n",work,user_work?" (manual override)":" (v40 tuned mapping)"); print_timestamp(); printf("CUDA block size: %zu%s\n",block,user_block?" (manual override)":"");
  constexpr size_t SIGN_BATCH_HOST=SIGN_BATCH; size_t scratch_bytes=work*SIGN_BATCH_HOST*sizeof(Scalar); Scalar* dscratch=nullptr; FieldElement* drxscratch=nullptr; CUDA_CHECK(cudaMalloc((void**)&dscratch,scratch_bytes)); if(BTCW_HYBRID_RX)CUDA_CHECK(cudaMalloc((void**)&drxscratch,scratch_bytes)); print_timestamp(); printf("K/Rx scratch: %.2f / %.2f GiB global\n",(double)scratch_bytes/(1024.0*1024.0*1024.0),drxscratch?(double)scratch_bytes/(1024.0*1024.0*1024.0):0.0);
 
- uint8_t hkey[32]={}, hhash[32]={}, prevhash[32]={}, prevtarget[32]={};
+ // Fixed Stage-2 target: 28 leading zero bits in the displayed/arith256 hash.
+ // hash_meets_target_le() compares the SHA256d bytes as a little-endian uint256,
+ // so this is (2^228 - 1): ff..ff 0f 00 00 00.
+ uint8_t hkey[32]={}, hhash[32]={}, prevhash[32]={};
  uint8_t htarget[32];
  memset(htarget, 0xFF, 28);
  htarget[28]=0x0F; htarget[29]=0; htarget[30]=0; htarget[31]=0;
- CUDA_CHECK(cudaMemcpy(dtarget,htarget,32,cudaMemcpyHostToDevice)); bool havehash=false,was_connected=false,conn_printed=false,disconnect_timing=false; auto disconnect_start=std::chrono::steady_clock::now(); const int DISCONNECT_SECONDS=3; int block_transitions=0; uint64_t nonce_prev=1234,hashlow=0,nonce_base=1; uint32_t throttle=0; auto session_start=std::chrono::steady_clock::now();
+ CUDA_CHECK(cudaMemcpy(dtarget,htarget,32,cudaMemcpyHostToDevice)); bool havehash=false,was_connected=false,conn_printed=false,disconnect_timing=false; auto disconnect_start=std::chrono::steady_clock::now(); const int DISCONNECT_SECONDS=3; int block_transitions=0; uint64_t nonce_prev=1234,hashlow=0,nonce_base=0; uint32_t throttle=0; auto session_start=std::chrono::steady_clock::now();
  print_timestamp(); printf("GPU initialized - waiting for block data...\n");
  while(g_running.load()){
    uint64_t changeCount=0; auto start=std::chrono::steady_clock::now();
    while(g_running.load() && std::chrono::steady_clock::now()-start<std::chrono::seconds(2)){
-     if((throttle%3)==0){ memcpy(hkey,(const void*)&shared->data[0],32); memcpy(hhash,(const void*)&shared->data[192],32); { uint8_t incoming[32]; memcpy(incoming,(const void*)shared->target,32); int any=0; for(int i=0;i<32;i++) any|=incoming[i]; if(any) memcpy(htarget,incoming,32); } if(!havehash){memcpy(prevhash,hhash,32);memcpy(prevtarget,htarget,32);havehash=true; CUDA_CHECK(cudaMemcpyAsync(dtarget,htarget,32,cudaMemcpyHostToDevice));} else if(memcmp(hhash,prevhash,32)!=0){memcpy(prevhash,hhash,32);block_transitions++;nonce_base=1;shared->nonce=SENTINEL_NONCE;shared->der_len=0;nonce_prev=SENTINEL_NONCE;print_timestamp();printf("New block data from node (block #%d this session)\n",block_transitions);} if(memcmp(htarget,prevtarget,32)!=0){memcpy(prevtarget,htarget,32); CUDA_CHECK(cudaMemcpyAsync(dtarget,htarget,32,cudaMemcpyHostToDevice)); print_timestamp(); printf("Node target %02x%02x%02x%02x%02x%02x%02x%02x...\n",htarget[31],htarget[30],htarget[29],htarget[28],htarget[27],htarget[26],htarget[25],htarget[24]);} CUDA_CHECK(cudaMemcpyAsync(dkey,hkey,32,cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpyAsync(dhash,hhash,32,cudaMemcpyHostToDevice)); }
+     if((throttle%3)==0){ memcpy(hkey,(const void*)&shared->data[0],32); memcpy(hhash,(const void*)&shared->data[192],32); if(!havehash){memcpy(prevhash,hhash,32);havehash=true;} else if(memcmp(hhash,prevhash,32)!=0){memcpy(prevhash,hhash,32);block_transitions++;nonce_base=0;shared->nonce=SENTINEL_NONCE;nonce_prev=SENTINEL_NONCE;print_timestamp();printf("New block data from node (block #%d this session)\n",block_transitions);} CUDA_CHECK(cudaMemcpyAsync(dkey,hkey,32,cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpyAsync(dhash,hhash,32,cudaMemcpyHostToDevice)); }
      throttle++;
-     CUDA_CHECK(cudaMemsetAsync(dnonce,0,sizeof(ulong))); CUDA_CHECK(cudaMemsetAsync(dfound,0,sizeof(uint))); CUDA_CHECK(cudaMemsetAsync(dctr,0,sizeof(uint))); CUDA_CHECK(cudaMemsetAsync(dderlen,0,sizeof(uint)));
+     CUDA_CHECK(cudaMemsetAsync(dnonce,0,sizeof(ulong))); CUDA_CHECK(cudaMemsetAsync(dfound,0,sizeof(uint))); CUDA_CHECK(cudaMemsetAsync(dctr,0,sizeof(uint)));
      size_t blocks=work/block;
-     btcw_mine<<<(unsigned)blocks,(unsigned)block>>>(dkey,dhash,dnonce,dfound,dderlen,dder,dctr,(ulong)nonce_base,(uint)gpu_num,dtab[0],dtab[1],dtab[2],dtab[3],dtab[4],dtab[5],dtarget,dscratch,drxscratch);
+     btcw_mine<<<(unsigned)blocks,(unsigned)block>>>(dkey,dhash,dnonce,dfound,dctr,(ulong)nonce_base,(uint)gpu_num,dtab[0],dtab[1],dtab[2],dtab[3],dtab[4],dtab[5],dtarget,dscratch,drxscratch);
      CUDA_CHECK(cudaGetLastError());
-     uint result_found=0,ctr=0,result_der_len=0; ulong result_nonce=0; uint8_t result_der[72]={};
-     CUDA_CHECK(cudaMemcpy(&result_found,dfound,sizeof(uint),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(&result_nonce,dnonce,sizeof(ulong),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(&ctr,dctr,sizeof(uint),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(&result_der_len,dderlen,sizeof(uint),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(result_der,dder,72,cudaMemcpyDeviceToHost)); changeCount+=ctr;
-     if(result_found){
-       if(result_der_len>72) result_der_len=72;
-       memcpy(const_cast<uint8_t*>(shared->der),result_der,result_der_len);
-       shared->der_len=result_der_len;
-       shared->nonce=result_nonce; nonce_prev=result_nonce;
-       print_timestamp(); printf("Share nonce=%016llx der_len=%u\n",(unsigned long long)result_nonce,result_der_len); fflush(stdout);
-     }
-     nonce_base += work*128ULL; if(nonce_base==0) nonce_base=1;
+     uint result_found=0,ctr=0; ulong result_nonce=0; CUDA_CHECK(cudaMemcpy(&result_found,dfound,sizeof(uint),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(&result_nonce,dnonce,sizeof(ulong),cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(&ctr,dctr,sizeof(uint),cudaMemcpyDeviceToHost)); changeCount+=ctr;
+     if(result_found){shared->nonce=result_nonce;nonce_prev=result_nonce;}
+     nonce_base = (nonce_base + work*128ULL) & 0xFFFFFFFFULL; if(nonce_base==0) nonce_base=1;
      memcpy(&hashlow,(const void*)&shared->data[192],8);
      if(hashlow==0){ if(!disconnect_timing){disconnect_start=std::chrono::steady_clock::now();disconnect_timing=true;} if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-disconnect_start).count()>=DISCONNECT_SECONDS){ if(conn_printed||!was_connected){print_timestamp();printf("!!! NOT CONNECTED TO BTCW NODE WALLET !!! Make sure your wallet has at least 1 utxo.\n");conn_printed=false;} std::this_thread::sleep_for(std::chrono::seconds(1)); }} else { if(!was_connected||!conn_printed){print_timestamp();printf("Connected to BTCW node wallet\n");conn_printed=true;} disconnect_timing=false;was_connected=true; }
    }
-   double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); double mh=(elapsed>0)?(double)changeCount/elapsed/1e6:0; auto up=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-session_start).count(); print_timestamp(); printf("Mining | %.2f MH/s | search=%016llx | work=%s | target=%02x%02x%02x%02x... | Blocks: %d | Up: %02lld:%02lld:%02lld\n",mh,(unsigned long long)nonce_base,was_connected?"node":"NONE",htarget[31],htarget[30],htarget[29],htarget[28],block_transitions,(long long)(up/3600),(long long)((up/60)%60),(long long)(up%60)); fflush(stdout);
+   double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); double mh=(elapsed>0)?(double)changeCount/elapsed/1e6:0; auto up=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-session_start).count(); print_timestamp(); printf("Mining | %.2f MH/s | Nonce: %016llx | Blocks: %d | Up: %02lld:%02lld:%02lld\n",mh,(unsigned long long)shared->nonce,block_transitions,(long long)(up/3600),(long long)((up/60)%60),(long long)(up%60)); fflush(stdout);
  }
  print_timestamp(); printf("Shutting down...\n");
- cudaFree(drxscratch); cudaFree(dscratch); cudaFree(dkey); cudaFree(dhash); cudaFree(dtarget); cudaFree(dnonce); cudaFree(dfound); cudaFree(dderlen); cudaFree(dder); cudaFree(dctr); for(auto p:dtab)cudaFree(p);
+ cudaFree(drxscratch); cudaFree(dscratch); cudaFree(dkey); cudaFree(dhash); cudaFree(dtarget); cudaFree(dnonce); cudaFree(dfound); cudaFree(dctr); for(auto p:dtab)cudaFree(p);
 #ifdef _WIN32
  UnmapViewOfFile((void*)shared); CloseHandle(mapping);
 #else
